@@ -14,7 +14,7 @@ use calcard::{
 };
 use chrono::{DateTime, Locale};
 use common::{
-    DEFAULT_LOGO_BASE64, Server,
+    Server,
     auth::AccountInfo,
     config::groupware::CalendarTemplateVariable,
     i18n,
@@ -37,6 +37,9 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use store::{ahash::AHashMap, write::now};
 use trc::AddContext;
 use utils::template::{Variable, Variables};
+
+/// Hosted Pulse logo when OSS `logo_resource` returns nothing.
+const PULSE_ITIP_LOGO_URL: &str = "https://pulsebusiness.ai/pulse-favicon.svg";
 
 pub(crate) trait SendImipTask: Sync + Send {
     fn send_imip(
@@ -84,7 +87,7 @@ async fn send_imip(
         .and_then(|msg| msg.from.rsplit('@').next())
         .unwrap_or("localhost");
 
-    // Obtain logo image
+    // Obtain logo image (Enterprise). Pulse fleet uses hosted logo URL in template when absent.
     let logo = match server.logo_resource(sender_domain).await {
         Ok(logo) => logo,
         Err(err) => {
@@ -96,20 +99,23 @@ async fn send_imip(
         }
     };
     let logo_cid = format!("logo.{}@{sender_domain}", now());
-    let logo = if let Some(logo) = &logo {
-        MimePart::new(
-            ContentType::new(logo.content_type.as_ref()),
-            BodyPart::Binary(logo.contents.as_slice().into()),
+    let logo_part = if let Some(logo) = &logo {
+        Some(
+            MimePart::new(
+                ContentType::new(logo.content_type.as_ref()),
+                BodyPart::Binary(logo.contents.as_slice().into()),
+            )
+            .inline()
+            .cid(&logo_cid),
         )
     } else {
-        MimePart::new(
-            ContentType::new("image/png"),
-            BodyPart::Binary(DEFAULT_LOGO_BASE64.as_bytes().into()),
-        )
-        .transfer_encoding("base64")
-    }
-    .inline()
-    .cid(&logo_cid);
+        None
+    };
+    let logo_src = if logo.is_some() {
+        format!("cid:{logo_cid}")
+    } else {
+        PULSE_ITIP_LOGO_URL.to_string()
+    };
 
     let account_info = server
         .account_info(account_id)
@@ -133,7 +139,7 @@ async fn send_imip(
                 itip_message.from.as_str(),
                 recipient.as_str(),
                 &summary,
-                &logo_cid,
+                &logo_src,
             )
             .await;
             let txt_body = html_to_text(&tpl.body);
@@ -154,25 +160,28 @@ async fn send_imip(
                 .body(MimePart::new(
                     ContentType::new("multipart/mixed"),
                     BodyPart::Multipart(vec![
-                        MimePart::new(
-                            ContentType::new("multipart/related"),
-                            BodyPart::Multipart(vec![
-                                MimePart::new(
-                                    ContentType::new("multipart/alternative"),
-                                    BodyPart::Multipart(vec![
-                                        MimePart::new(
-                                            ContentType::new("text/plain"),
-                                            BodyPart::Text(txt_body.into()),
-                                        ),
-                                        MimePart::new(
-                                            ContentType::new("text/html"),
-                                            BodyPart::Text(tpl.body.as_str().into()),
-                                        ),
-                                    ]),
-                                ),
-                                logo.clone(),
-                            ]),
-                        ),
+                        {
+                            let mut related = vec![MimePart::new(
+                                ContentType::new("multipart/alternative"),
+                                BodyPart::Multipart(vec![
+                                    MimePart::new(
+                                        ContentType::new("text/plain"),
+                                        BodyPart::Text(txt_body.into()),
+                                    ),
+                                    MimePart::new(
+                                        ContentType::new("text/html"),
+                                        BodyPart::Text(tpl.body.as_str().into()),
+                                    ),
+                                ]),
+                            )];
+                            if let Some(ref part) = logo_part {
+                                related.push(part.clone());
+                            }
+                            MimePart::new(
+                                ContentType::new("multipart/related"),
+                                BodyPart::Multipart(related),
+                            )
+                        },
                         MimePart::new(
                             ContentType::new("text/calendar")
                                 .attribute("method", summary.method())
@@ -288,7 +297,7 @@ pub async fn build_itip_template(
     from: &str,
     to: &str,
     summary: &ItipSummary,
-    logo_cid: &str,
+    logo_src: &str,
 ) -> Details {
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -447,7 +456,7 @@ pub async fn build_itip_template(
         Variable::Block(details),
     );
     variables.insert_single(CalendarTemplateVariable::PageTitle, subject.clone());
-    variables.insert_single(CalendarTemplateVariable::LogoCid, format!("cid:{logo_cid}"));
+    variables.insert_single(CalendarTemplateVariable::LogoCid, logo_src.to_string());
 
     if let Some(guests) = fields
         .iter()
